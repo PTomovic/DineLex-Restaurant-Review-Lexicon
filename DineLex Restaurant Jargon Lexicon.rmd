@@ -1,0 +1,534 @@
+---
+title: "DineLex: Restaurant Review Lexicon Creation"
+author: "Predrag Tomovic"
+date: "2025-01-16"
+output: html_document
+---
+## Introduction
+
+Understanding customer feedback is critical for businesses in the restaurant industry, where customer satisfaction and experience directly impact success. Reviews often contain valuable insights about food, service, ambiance, and overall experience, but manually analyzing this data can be time-consuming and prone to bias. Automating the categorization of review content can provide businesses with actionable insights more efficiently.
+
+This project aims to classify a dataset of 25,000 restaurant-related words into five distinct categories: Food, Service, Ambiance, Drinks, and Other. The resulting lexicon is designed to support sentiment analysis, enhance customer feedback analysis, and drive data-informed decision-making in the hospitality industry.
+
+Using R and OpenAI’s GPT-3.5-turbo API, this project demonstrates a robust workflow for handling large-scale text classification tasks. Challenges such as API limits, ambiguous terms, and ensuring classification consistency were addressed through batching, error handling, and iterative debugging.
+
+By completing this project, I’ve created a comprehensive lexicon that can streamline sentiment analysis for restaurants, enabling better understanding of customer reviews and improved service strategies.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading Packages & Data
+
+To perform data manipulation, API interactions, and natural language processing, several R packages are utilized:
+
+tidyverse: For efficient data manipulation and visualization.
+httr: To handle HTTP requests for interacting with APIs.
+gptstudio: Facilitates seamless interaction with the ChatGPT API.
+jsonlite: Enables parsing and handling of JSON data structures.
+
+These tools ensure a robust and streamlined workflow for developing the restaurant jargon lexicon.
+
+```{r loading packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(httr)
+library(gptstudio)
+library(jsonlite)
+```
+
+The excluded_words dataset serves as the starting point for building the restaurant jargon lexicon. This dataset contains words excluded during the tokenization process and NRC lexicon anti-join. These terms will be classified and refined to create a meaningful lexicon tailored to the restaurant industry.
+
+```{r loading data}
+# Load the excluded_words dataset
+excluded_words <- read.csv("excluded_words_with_categories.csv", stringsAsFactors = FALSE)
+```
+
+## Praparing for Batch API calls
+
+### Adding the processed column
+
+To prepare for efficient batch API calls, a new column named processed is added to the excluded_words dataset. This column is initialized with FALSE for all rows, signifying that no words have been processed yet.
+
+This step is critical for managing iterative processing. By tracking the processing status of each word, we can ensure that only uncategorized words are sent in subsequent API calls, optimizing resource usage and reducing redundancy.
+
+```{r adding processed column}
+# Add a 'processed' column to track progress
+excluded_words$processed <- FALSE
+```
+
+### Ensuring the category column exists
+
+This step verifies the presence of a category column in the excluded_words dataset. If the column is missing, it is created and initialized with NA values for all rows.
+
+To ensure smooth execution of the API classification process, this step prevents potential errors by establishing a dedicated column for storing the categorized output. It acts as a safeguard, ensuring the dataset structure is ready for subsequent operations.
+
+```{r adding category column}
+# Add the `category` column
+if (!"category" %in% colnames(excluded_words)) {
+  excluded_words$category <- NA  # Initialize as NA for all rows
+}
+
+```
+
+### Setting api_key, openai_url and API key in environment
+
+This section configures the API key and endpoint required for communication with the ChatGPT API. By setting these values in the environment, the document ensures secure and streamlined API interactions.
+
+```{r}
+
+# Set API key and endpoint
+openai_url <- "https://api.openai.com/v1/chat/completions"
+api_key <- Sys.getenv("OPENAI_API_KEY")
+
+```
+
+
+## Testing the API connection
+
+In this step, the code tests the API connection by sending a batch of unprocessed words to OpenAI’s model for classification into five predefined categories: Food, Service, Ambiance, Drinks, and Other. A prompt is generated and sent to the API, which then processes the words and returns the categorized results. The classified words are saved and used to update the excluded_words dataset, marking them as processed. This testing phase ensures that the API connection is functioning correctly and that the classification process is efficient and accurate.
+
+```{r Testing API connection, message=FALSE}
+
+# Test batch size
+batch_size <- 5  # Small batch for testing
+unprocessed <- excluded_words %>% filter(!processed)  # Filter unprocessed rows
+batches <- split(unprocessed$word, ceiling(seq_along(unprocessed$word) / batch_size))  # Split into batches
+test_batch <- batches[[1]]  # Use the first batch for testing
+
+# Generate the prompt
+prompt <- paste(
+  "Classify the following words into these categories: Food, Service, Ambiance, Drinks, or Other.",
+  "Here are some examples for context:",
+  "Food: pizza, burger, pasta, salad, steak.",
+  "Service: waiter, quick, friendly, rude, reservation.",
+  "Ambiance: cozy, loud, patio, decor, romantic.",
+  "Drinks: coffee, wine, cocktail, beer, soda.",
+  "Other: random, unrelated, generic, example, miscellaneous.",
+  "Words to classify:", paste(test_batch, collapse = ", "),
+  "Only respond with a list of categories matching the order of the words.")
+
+# Send API request
+response <- POST(
+  url = openai_url,
+  add_headers(Authorization = paste("Bearer", api_key)),
+  body = list(
+    model = "gpt-3.5-turbo",
+    messages = list(
+      list(role = "system", content = "You are a helpful assistant."),
+      list(role = "user", content = prompt)
+    ),
+    max_tokens = 50
+  ),
+  encode = "json"
+)
+
+# Save raw response to inspect in case of errors
+raw_response <- content(response, as = "text")
+writeLines(raw_response, "api_raw_response.json")
+
+# Parse the response
+classifications <- NULL
+tryCatch({
+  content_parsed <- content(response, as = "parsed", simplifyVector = TRUE)
+  
+  # Check if 'choices' is present and valid
+  if (!is.null(content_parsed$choices) && length(content_parsed$choices) > 0) {
+    message_content <- content_parsed$choices$message$content[1]  # Since it's a single-row data frame
+    classifications <- strsplit(message_content, ",\\s*")[[1]]
+    classifications <- trimws(classifications)  # Remove leading/trailing whitespace
+  } else {
+    stop("No valid choices found in the response.")
+  }
+}, error = function(e) {
+  message("Error parsing response: ", e$message)
+})
+
+# Check classifications and assign fallback if needed
+if (is.null(classifications) || length(classifications) != length(test_batch)) {
+  warning("Mismatch or NULL classifications. Assigning fallback categories.")
+  classifications <- rep("Unclassified", length(test_batch))
+}
+
+# Create a data frame with results
+result <- data.frame(
+  word = test_batch,
+  category = classifications
+)
+
+# Update the excluded_words dataset
+excluded_words <- excluded_words %>%
+  mutate(
+    category = ifelse(word %in% result$word, result$category[match(word, result$word)], category),
+    processed = ifelse(word %in% result$word, TRUE, processed)
+)
+
+# View results for the test batch
+print(head(result))
+
+```
+
+Below is the output from the API test, showing the first few categorized words from the excluded_words_with_categories.csv file:
+
+```{r}
+# Display the output from the categorized dataset
+head(read.csv("~/R practice/Restaurant Jargon/excluded_words_with_categories.csv"))
+
+```
+
+
+## Debugging the "\$ operator is invalid for atomic vector" issue
+
+### Step 1: Inspecting Raw and Parsed API Response
+
+Before diving into any parsing or manipulation of the response, it's important to understand the structure of the data returned by the OpenAI API. The raw response may contain nested elements or structures that we need to handle correctly in the subsequent steps.
+
+This code snippet prints the raw response returned by the API and then parses it into a more accessible format. The str() function is used to examine the structure of the parsed content. This step is crucial because it provides insights into the API's response format, which can be key to resolving errors like "\$ operator is invalid for atomic vector"
+
+```{r}
+# Inspect the structure of the parsed response
+
+print(raw_response)  # Inspect raw JSON response
+content_parsed <- content(response, as = "parsed", simplifyVector = TRUE)
+str(content_parsed)  # Check full structure
+
+```
+**Raw Response:** The first output shows the raw JSON string returned by the API. This string includes the actual results from the GPT model, but it needs to be parsed into a structured format for further use.
+
+**Parsed Response Structure:** The second output shows the parsed structure of the response. By examining this, we can determine where the data resides (e.g., in the choices field) and how to access it correctly. This step helps us avoid errors when trying to extract or manipulate the response data, as seen in the subsequent debugging steps.
+
+### Step 2: Correctly Parsing and Accessing Content
+
+After examining the raw and parsed response in the previous step, the next step is to ensure that we correctly access the message.content field, where the classification results are stored. The initial attempt to extract the classifications might fail if the structure is slightly different than expected, or if the content is nested in an unexpected way. This check verifies the structure and safely extracts the relevant data.
+
+The strsplit() function is used to break down the comma-separated content in the message.content field into individual classifications. If the content is missing or inaccessible, the code prints an error message.
+
+```{r}
+# Parse the response
+response_text <- content(response, as = "text", encoding = "UTF-8")
+content_parsed <- fromJSON(response_text, flatten = TRUE)
+
+# Inspect structure for debugging
+str(content_parsed)
+
+# Correctly access `message.content`
+if (!is.null(content_parsed$choices$message.content)) {
+  classifications <- strsplit(content_parsed$choices$message.content[1], ", ")[[1]]
+  print(classifications)
+} else {
+  print("Classifications are NULL or inaccessible.")
+}
+
+```
+**Parsed Response Structure:** After parsing the response with fromJSON(), we inspect the structure again to check if message.content is properly nested under choices. This structure gives us a clearer view of where the classifications reside.
+
+**Classifications Extraction:** If message.content is accessible, the code splits the content into individual classifications, separated by commas. This step ensures that you can work with each classification separately. If message.content is missing or inaccessible, an error message is printed, which helps you catch potential issues early.
+
+### Step 3: Fixing the Raw API Response File
+
+After examining the response structure in the previous steps, we noticed that some issues arose when attempting to process the raw API response. To address this, we took a step to read the raw JSON response from the file, correct any formatting issues (such as unexpected character encoding or line breaks), and save it to a new file. This ensures that the file is properly formatted for further processing.
+
+The writeLines() function is used to ensure that the raw JSON file is correctly saved, and then the fromJSON() function is applied to re-parse the content, enabling us to inspect the structure again.
+
+```{r}
+writeLines(readLines("api_raw_response_batch_1.json"), "api_raw_response_batch_1_fixed.json", useBytes = TRUE)
+
+response_content <- fromJSON("api_raw_response_batch_1.json")
+str(response_content)
+```
+**File Fixing:** The writeLines(readLines(...)) part ensures that the raw response file is correctly read and written back, handling any encoding issues or problematic characters that may have caused parsing errors earlier.
+
+**Response Structure Inspection:** After fixing the file, we again inspect the structure of the response using str(response_content). This allows us to ensure the file is now in a format that can be properly parsed and processed. We can also observe if there are any remaining issues in the file structure that need to be addressed.
+
+### Step 4: Inspecting and Troubleshooting choices Structure
+In this step, we attempt to print and inspect the contents of response_content\$choices, and specifically access response_content\$choices[[1]]\$message\$content. The goal was to better understand the structure and identify why we're encountering the error Error in response_content\$choices[[1]]\$message : \$ operator is invalid for atomic vectors.
+
+The error suggests that response_content\$choices[[1]]\$message is not structured as expected. Instead of being a list or data frame (which would allow access with the \$ operator), it seems like an atomic vector, which requires a different approach to access its contents.
+
+```{r, eval=FALSE}
+
+## Debugging step
+print(response_content$choices)
+print(response_content$choices[[1]]$message$content)
+
+```
+**response_content\$choices:** This prints the structure of the choices element. From the output, we see that choices is a data frame with 1 row and 4 columns (index, message, logprobs, and finish_reason). The issue lies within the message field, which is not behaving as expected.
+
+**Error in Accessing message\$content:** The error message indicates that response_content\$choices[[1]]\$message is being treated as an atomic vector rather than a data frame or list. This prevents access to \$message\$content in the usual way.
+
+### Step 5: Verifying choices Class and Content
+
+In this step, we check the class and preview the contents of response_content\$choices. The goal is to confirm whether choices is indeed a data frame and inspect its structure more closely.
+
+From the output, we observe that response_content\$choices is confirmed as a data frame, but the message column within it is still a data frame itself, which complicates direct access. This step reinforces that further parsing is required to access message\$content properly.
+
+```{r}
+print(class(response_content$choices))  # Confirm it's a data.frame
+print(head(response_content$choices))   # Check the content
+
+```
+
+**Class of response_content\$choices:** The output confirms that response_content\$choices is indeed a data frame, which matches expectations.
+
+**Preview of response_content\$choices:** The preview shows that the message column is still a data frame, and the error we encountered earlier stems from trying to directly access message\$content in its current nested format.
+
+### Step 6: Accessing message.content Directly
+
+Here, we attempt to directly access message.content from the choices data frame. The goal is to extract the content of the message (i.e., the classifications), but this results in a NULL output. This suggests that accessing message.content directly is not correct due to the nested structure of the data.
+
+```{r}
+message_content <- response_content$choices$message.content[1]  # Access column directly
+print(message_content)  # Confirm it holds the classifications
+
+```
+
+**message_content is NULL:** This indicates that the direct approach to access message.content is failing, likely because message is a nested data frame within choices and needs further parsing to access the content field.
+
+### Step 7: Examining the Structure of response_content\$choices
+
+In this step, we examine the structure of response_content\$choices to better understand its contents. The goal is to identify how the data is nested and find the correct way to extract the message.content field, which holds the classifications.
+
+```{r}
+str(response_content$choices)  # Examine the structure
+print(response_content$choices)  # View the content
+
+```
+
+**str(response_content\$choices)** reveals that message is a nested data frame within choices, containing fields such as role, content, and refusal. The content field holds the classifications you need (e.g., "Other, Other, Ambiance, Ambiance, Other").
+**print(response_content\$choices)** shows the contents of the choices data frame, confirming that message is itself a data frame with the content field nested within it.
+
+### Step 8: Inspecting the Columns of response_content\$choices\$message
+In this step, we check the column names of response_content\$choices to identify how the data is organized and explore the structure of the nested message data frame. This will help us understand how to access the content field, which holds the classifications.
+
+```{r}
+print(colnames(response_content$choices))  # Check available columns
+print(response_content$choices$message)
+str(response_content$choices$message)
+
+```
+**print(colnames(response_content\$choices))** confirms the column names of response_content\$choices, where we see that one of the columns is message. This column is itself a data frame, which contains the relevant content and other metadata.
+
+**print(response_content\$choices\$message)** shows the contents of the message data frame, which includes the role (the assistant's role), content (the classification string), and refusal (which is not used in this case). The content field holds the classification string: "Other, Other, Ambiance, Ambiance, Other".
+
+**str(response_content\$choices\$message)** reveals that message has three fields: role, content, and refusal. The content field is the one containing the classification data.
+
+## Batching and API Processing Overview
+
+To categorize the dataset of 26,533 rows of excluded words, I used an API that processes data in batches. Each batch consisted of 5 words, and the process was repeated for a total of 5,306 iterations. This batching approach allowed for efficient handling of large datasets, ensuring each batch was processed independently and within the limits of the API's capacity.
+
+To avoid unnecessary execution, the code includes a run_chunk <- FALSE condition. This ensures that the batch processing is only triggered when needed, preventing redundant API calls and improving the efficiency of the process.
+
+By organizing the process into manageable batches, I ensured that the API could handle the load effectively, avoiding timeouts and maximizing throughput.
+
+```{r batching and API processing}
+
+run_chunk <- FALSE  # Set to TRUE only if you want to execute this chunk.
+
+if(run_chunk){
+batches <- split(excluded_words$word, ceiling(seq_along(excluded_words$word) / batch_size))
+# Loop through batches
+for (i in seq_along(batches)) {
+  # Create the prompt
+  prompt <- paste(
+    "Classify the following words into these categories: Food, Service, Ambiance, Drinks, or Other.",
+    "Words:", paste(batches[[i]], collapse = ", "),
+    "Only respond with a list of categories matching the order of the words."
+  )
+  
+  # Send API request
+  response <- POST(
+    url = openai_url,
+    add_headers(Authorization = paste("Bearer", api_key)),
+    body = list(
+      model = "gpt-3.5-turbo",
+      messages = list(
+        list(role = "system", content = "You are a helpful assistant."),
+        list(role = "user", content = prompt)
+      ),
+      max_tokens = 100
+    ),
+    encode = "json"
+  )
+  
+  # Save raw response for debugging
+  raw_response <- content(response, as = "text", encoding = "UTF-8")
+  writeLines(raw_response, paste0("api_raw_response_batch_", i, ".json"))
+
+  # Parse the API response
+  classifications <- NULL
+  tryCatch({
+    response_content <- content(response, as = "parsed", simplifyVector = TRUE)
+    
+    # Updated parsing logic
+    if (is.data.frame(response_content$choices) && is.data.frame(response_content$choices$message)) {
+      message_content <- response_content$choices$message$content[1]  # Extract the first row's content
+      classifications <- strsplit(message_content, ",\\s*")[[1]]  # Split by commas and trim spaces
+      classifications <- trimws(classifications)
+      print(classifications)  # Debugging output
+    } else {
+      stop("Unexpected structure for choices or message fields.")
+    }
+  }, error = function(e) {
+    message("Error parsing response: ", e$message)
+    classifications <- rep("Unclassified", length(batches[[i]]))
+  })
+  
+  # Ensure classifications match batch size
+  if (length(classifications) != length(batches[[i]])) {
+    warning("Mismatch in classifications and batch size for batch ", i)
+    classifications <- rep("Unclassified", length(batches[[i]]))
+  }
+  
+  # Match rows in the dataset
+  indices <- match(batches[[i]], excluded_words$word)
+  valid_indices <- !is.na(indices)
+  excluded_words$category[indices[valid_indices]] <- classifications[valid_indices]
+  excluded_words$processed[indices[valid_indices]] <- TRUE
+  
+  # Save progress periodically
+  if (i %% 10 == 0) {
+    write.csv(excluded_words, "excluded_words_with_categories.csv", row.names = FALSE)
+    print(paste("Saved progress after batch", i))
+  }
+  
+  # Print progress
+  print(paste("Processed batch", i, "of", length(batches)))
+}
+
+write.csv(excluded_words, "excluded_words_with_categories.csv", row.names = FALSE)} else {
+  message("This chunk is skipped. To run it, set `run_chunk <- TRUE`.")
+}
+
+```
+
+This section demonstrates the effective use of batching to manage and process a large number of records, showcasing how this method facilitated efficient API integration and prevented redundant execution.
+
+## Data Segmentation and Export
+
+In this step, the dataset excluded_words is split into two subsets: one for restaurant jargon (excluding the "Other" category) and another for the "Other" words category. Each subset is saved as a separate CSV file for future use. Additionally, a summary of the number of rows in each dataset is provided to give insight into the segmentation.
+
+```{r saving results}
+# Create the restaurant_jargon data frame (excluding "Other" category)
+restaurant_jargon <- read.csv("~/R practice/Restaurant Jargon/excluded_words_with_categories.csv") %>%
+  filter(category != "Other")
+
+# Create the other_words data frame (only "Other" category)
+other_words <- read.csv("~/R practice/Restaurant Jargon/excluded_words_with_categories.csv") %>%
+  filter(category == "Other")
+
+# Save these data frames for future use
+write.csv(restaurant_jargon, "restaurant_jargon.csv", row.names = FALSE)
+write.csv(other_words, "other_words.csv", row.names = FALSE)
+
+# View a summary of the new data frames
+print(paste("Restaurant Jargon:", nrow(restaurant_jargon), "rows"))
+print(paste("Other Words:", nrow(other_words), "rows"))
+
+```
+
+**Suggested Note for the User:**
+Please modify the file path variable to point to the correct directory where your CSV file is located. For example, update it to "path/to/your/file/excluded_words_with_categories.csv".
+
+## Restaurant Jargon Structure
+
+This code generates a pie chart to visually display the distribution of words across different categories in the restaurant jargon lexicon. 
+
+```{r}
+
+# Count the number of words in each category
+category_counts <- table(restaurant_jargon$category)
+
+# Create a pie chart
+pie(category_counts, 
+    labels = paste(names(category_counts), "\n", category_counts), 
+    main = "Distribution of Restaurant Jargon Categories", 
+    col = rainbow(length(category_counts)))
+
+```
+
+
+The pie chart displayed more than the 5 categories specified in the OpenAI API prompt, indicating the need for further investigation.
+
+```{r}
+# Count distinct values in the 'category' column
+distinct_category_count <- restaurant_jargon %>%
+  summarise(distinct_categories = n_distinct(category))
+
+# Print the result
+print(distinct_category_count)
+```
+There are a total of 42 categories. The following code explores the names of all categories along with their frequency within the 'category' column.
+
+```{r}
+# Get distinct values and their counts
+category_counts <- restaurant_jargon %>%
+  group_by(category) %>%
+  summarise(count = n(), .groups = 'drop')
+
+# Print the result
+view(category_counts)
+```
+
+
+Upon examining the categories, it was concluded that all categories outside the predefined five could be merged into existing ones without compromising the quality of categorization. The following code addresses each unwanted category individually and places it into the most logical category.
+
+```{r}
+
+# Define the mapping of existing categories to the desired categories
+category_mapping <- list(
+  food = c("Appetizer", "Cuisine", "Food.", "Food", "Menu", "Price", "Pricing", "Taste", "Texture"), # All food-related categories
+  drinks = c("Drink", "Drinks.", "Drinks"), # All drinks-related categories
+  service = c("Fees", "Service.", "Service", "Time"), # Add all service-related categories here
+  ambiance = c("ambiance.", "Ambiance", "Ambience", "Atmosphere", "Attire", "Clientele", "Companions", "Decorations", "Energy", "Entertainment", "Establishment", "Facilites", "Gathering", "Glassware", "Silverware", "Socializing"), # All ambiance-related categories
+  other = c("Promotions", "Unclassified", "Other.", "None", "Medical", "Drugs", "Advertisement", "- Other", "Restaurant") # All other categories
+)
+
+# Function to map categories
+map_category <- function(category) {
+  for (new_category in names(category_mapping)) {
+    if (category %in% category_mapping[[new_category]]) {
+      return(new_category)
+    }
+  }
+  return(category) # Return the original category if no match is found
+}
+
+# Apply the mapping to the dataframe
+restaurant_jargon <- restaurant_jargon %>%
+  mutate(category = sapply(category, map_category))
+
+# Check the result
+category_counts <- restaurant_jargon %>%
+  group_by(category) %>%
+  summarise(count = n(), .groups = 'drop')
+
+print(category_counts)
+```
+I had to rerun this code chunk several times, iterating by adding additional categories to the five desired categories until the expected result was achieved.
+
+With all unnecessary categories addressed and appropriately merged, we can now proceed with the final visualization.
+
+```{r}
+
+# Count the number of words in each category
+category_counts <- table(restaurant_jargon$category)
+
+# Create a pie chart
+pie(category_counts, 
+    labels = paste(names(category_counts), "\n", category_counts), 
+    main = "Distribution of Restaurant Jargon Categories", 
+    col = rainbow(length(category_counts)))
+
+```
+```{r, eval=FALSE, echo=FALSE, message=FALSE}
+# Save the properly categorized restaurant jargon as 'restaurant_jargon_clean.csv'
+write.csv(restaurant_jargon, "restaurant_jargon_clean.csv", row.names = FALSE)
+
+# Confirm the file has been saved
+print("The cleaned restaurant jargon has been saved as 'restaurant_jargon_clean.csv'.")
+
+```
+
+
+## Conclusion
+
+This document outlined the process of organizing, categorizing, and processing restaurant-related data, with an emphasis on excluding irrelevant terms and utilizing API calls for classification. Through the application of batching techniques and conditional execution, we ensured the efficient handling of large datasets while maintaining flexibility. Ultimately, the segmented data was exported for future analysis, contributing to the goal of improving the accuracy and relevance of sentiment categorization. From preparing the data to refining classifications, this project underscores the importance of meticulous data preprocessing and seamless API integration in deriving meaningful insights. By optimizing these steps, we have set the stage for more actionable insights, staying aligned with the original objective of enhancing customer review analysis and supporting data-driven decision-making in the hospitality industry.
