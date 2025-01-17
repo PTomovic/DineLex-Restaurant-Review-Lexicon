@@ -35,18 +35,6 @@ The resulting dataset can be integrated into broader data analysis workflows, in
 5. **Final Export**  
    - Cleaned and categorized dataset saved as `restaurant_jargon_clean.csv` for future use.  
 
-## Repository Structure  
-├── data/
-│ ├── excluded_words_with_categories.csv # Raw input data
-│ ├── restaurant_jargon_clean.csv # Final categorized lexicon
-├── scripts/
-│ ├── data_cleaning.R # Data preparation scripts
-│ ├── api_classification.R # API integration and classification
-│ ├── visualization.R # Visualization scripts
-├── visuals/
-│ ├── category_distribution.png # Distribution of terms across categories
-├── README.md # Project documentation
-
 ## Installation and Usage  
 
 ### Prerequisites  
